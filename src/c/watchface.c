@@ -20,7 +20,7 @@
 #define KEY_CAL_COLORS        13  // packed "c0,c1,c2,...,c9" palette indices
 
 // Rendering of Screenshots
-#define SCREENSHOT_MODE 1
+#define SCREENSHOT_MODE 0
 
 // --- Colour palette -------------------------------------------
 // Must match PALETTE in index.html exactly.

@@ -1,7 +1,11 @@
 // index.js — PebbleKit JS
-console.log("index.js v9 loaded");
+console.log("index.js v10 loaded");
 
 var MAX_CALENDARS = 10;
+
+// Cached geolocation position
+var s_last_lat = null;
+var s_last_lng = null;
 
 // ─── Weather ──────────────────────────────────────────────────────────────────
 
@@ -111,25 +115,18 @@ function parseICS(raw, calendarIndex, now, cutoff) {
         if (colonIdx < 0) continue;
         var key     = line.substring(0, colonIdx).toUpperCase().split(";")[0];
         var value   = line.substring(colonIdx + 1);
-        if (key === "DTSTART")      current.dtstart  = parseICSDate(value);
-        else if (key === "DTEND")   current.dtend    = parseICSDate(value);
+        if (key === "DTSTART")       current.dtstart  = parseICSDate(value);
+        else if (key === "DTEND")    current.dtend    = parseICSDate(value);
         else if (key === "DURATION") current.duration = parseDuration(value);
     }
     return events;
 }
 
 // ─── Send display settings ────────────────────────────────────────────────────
-// Keys:
-//   2  = KEY_TEMPERATURE_UNIT
-//   3  = KEY_SHOW_DATE
-//   8  = KEY_SHOW_TICKS
-//   12 = KEY_HOUR_HAND_COLOR
-//   13 = KEY_CAL_COLORS  packed "c0,c1,...,c9"
 
 function sendDisplaySettings() {
     var config = JSON.parse(localStorage.getItem("calendarConfig") || "{}");
 
-    // Build packed colour string for all 10 calendars
     var defaults = [0, 4, 8, 2, 9, 5, 1, 7, 10, 3];
     var colors = [];
     for (var i = 0; i < MAX_CALENDARS; i++) {
@@ -170,37 +167,53 @@ function sendEventsToWatch(events) {
 
 // ─── Fetch calendars ──────────────────────────────────────────────────────────
 
+// Track consecutive failures per calendar slot to avoid hammering dead URLs
+var s_cal_fail_count = [0,0,0,0,0,0,0,0,0,0];
+var MAX_FAIL_COUNT = 3;
+
 function fetchCalendar(url, calendarIndex, now, cutoff, callback) {
     var xhr = new XMLHttpRequest();
     xhr.open("GET", url, true);
     xhr.onload = function() {
         if (xhr.status === 200) {
             try {
+                s_cal_fail_count[calendarIndex] = 0; // reset on success
                 callback(null, parseICS(xhr.responseText, calendarIndex, now, cutoff));
             } catch (e) {
                 console.log("ICS parse error cal " + calendarIndex + ": " + e);
+                s_cal_fail_count[calendarIndex]++;
                 callback(e, []);
             }
         } else {
+            console.log("HTTP " + xhr.status + " for cal " + calendarIndex);
+            s_cal_fail_count[calendarIndex]++;
             callback(new Error("HTTP " + xhr.status), []);
         }
     };
-    xhr.onerror = function() { callback(new Error("Network error"), []); };
+    xhr.onerror = function() {
+        s_cal_fail_count[calendarIndex]++;
+        callback(new Error("Network error"), []);
+    };
     xhr.send();
 }
 
 function fetchAllCalendars() {
     var config = JSON.parse(localStorage.getItem("calendarConfig") || "{}");
 
-    // Build list preserving original index so calIndex matches colour slot
     var entries = [];
     for (var i = 0; i < MAX_CALENDARS; i++) {
         var url = config["url" + i] || "";
-        if (url.length > 0) entries.push({ url: url, idx: i });
+        if (url.length > 0) {
+            if (s_cal_fail_count[i] >= MAX_FAIL_COUNT) {
+                console.log("Skipping cal " + i + " after " + s_cal_fail_count[i] + " failures");
+                continue;
+            }
+            entries.push({ url: url, idx: i });
+        }
     }
 
     if (entries.length === 0) {
-        console.log("No calendar URLs configured");
+        console.log("No calendar URLs to fetch");
         return;
     }
 
@@ -217,6 +230,32 @@ function fetchAllCalendars() {
     });
 }
 
+// ─── Combined refresh (weather + calendars) ───────────────────────────────────
+
+function refreshWeather(cfg) {
+    navigator.geolocation.getCurrentPosition(function(pos) {
+        s_last_lat = pos.coords.latitude;
+        s_last_lng = pos.coords.longitude;
+        fetchWeather(s_last_lat, s_last_lng, cfg.useFahrenheit || false);
+    }, function(err) {
+        console.log("Geolocation error: " + err.message);
+        // Fall back to cached position if available
+        if (s_last_lat !== null) {
+            console.log("Using cached position");
+            fetchWeather(s_last_lat, s_last_lng, cfg.useFahrenheit || false);
+        }
+    }, {
+        timeout: 10000,
+        maximumAge: 60 * 60 * 1000  // accept a cached position up to 1 hour old
+    });
+}
+
+function refreshAll() {
+    var cfg = JSON.parse(localStorage.getItem("calendarConfig") || "{}");
+    refreshWeather(cfg);
+    fetchAllCalendars();
+}
+
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 Pebble.addEventListener("ready", function() {
@@ -224,24 +263,11 @@ Pebble.addEventListener("ready", function() {
 
     var config = JSON.parse(localStorage.getItem("calendarConfig") || "{}");
     sendDisplaySettings();
-
-    navigator.geolocation.getCurrentPosition(function(pos) {
-        fetchWeather(pos.coords.latitude, pos.coords.longitude,
-                     config.useFahrenheit || false);
-    }, function(err) {
-        console.log("Geolocation error: " + err.message);
-    }, { timeout: 15000 });
-
+    refreshWeather(config);
     fetchAllCalendars();
 
-    setInterval(fetchAllCalendars, 30 * 60 * 1000);
-    setInterval(function() {
-        var cfg = JSON.parse(localStorage.getItem("calendarConfig") || "{}");
-        navigator.geolocation.getCurrentPosition(function(pos) {
-            fetchWeather(pos.coords.latitude, pos.coords.longitude,
-                         cfg.useFahrenheit || false);
-        }, function() {}, { timeout: 15000 });
-    }, 30 * 60 * 1000);
+    // Single consolidated interval: weather + calendars every 60 minutes
+    setInterval(refreshAll, 60 * 60 * 1000);
 });
 
 Pebble.addEventListener("showConfiguration", function() {
@@ -259,11 +285,10 @@ Pebble.addEventListener("webviewclosed", function(e) {
             var config = JSON.parse(decoded);
             localStorage.setItem("calendarConfig", JSON.stringify(config));
             console.log("Config saved");
+            // Reset failure counts so newly configured URLs get a fresh attempt
+            s_cal_fail_count = [0,0,0,0,0,0,0,0,0,0];
             sendDisplaySettings();
-            navigator.geolocation.getCurrentPosition(function(pos) {
-                fetchWeather(pos.coords.latitude, pos.coords.longitude,
-                             config.useFahrenheit || false);
-            }, function() {}, { timeout: 15000 });
+            refreshWeather(config);
             fetchAllCalendars();
         } catch (err) {
             console.log("Failed to parse config response: " + err);
