@@ -2,13 +2,13 @@
     "author": "dfrench47@gmail.com",
     "dependencies": {},
     "keywords": [],
-    "name": "pebble-analog-c",
+    "name": "ata",
     "pebble": {
         "capabilities": [
             "location",
             "configurable"
         ],
-        "displayName": "pebble-analog-c",
+        "displayName": "Analogue Time Arc",
         "enableMultiJS": true,
         "messageKeys": {
             "BackgroundColour": 0,
@@ -43,5 +43,5 @@
             "watchface": true
         }
     },
-    "version": "1.0.0"
+    "version": "1.2.0"
 }
