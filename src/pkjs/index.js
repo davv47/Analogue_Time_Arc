@@ -1,5 +1,5 @@
 // index.js — PebbleKit JS
-console.log("index.js v10 loaded");
+console.log("index.js v11 loaded");
 
 var MAX_CALENDARS = 10;
 
@@ -74,37 +74,180 @@ function parseDuration(str) {
     return ms;
 }
 
+// ─── RRULE parsing ───────────────────────────────────────────────────────────
+// Supports FREQ=DAILY/WEEKLY/MONTHLY/YEARLY, INTERVAL, COUNT, UNTIL, BYDAY.
+// Returns an array of occurrence start Dates within [now, cutoff].
+
+var BYDAY_MAP = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+
+function parseRRule(rruleStr) {
+    var rule = {};
+    var parts = rruleStr.split(";");
+    for (var i = 0; i < parts.length; i++) {
+        var eq = parts[i].indexOf("=");
+        if (eq < 0) continue;
+        var k = parts[i].substring(0, eq).toUpperCase();
+        var v = parts[i].substring(eq + 1);
+        rule[k] = v;
+    }
+    return rule;
+}
+
+// Returns midnight (local) of the date represented by a Date object
+function dateOnly(d) {
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+// Add calendar months safely (handles month-end overflow by clamping)
+function addMonths(d, n) {
+    var result = new Date(d.getTime());
+    var day = result.getDate();
+    result.setDate(1);
+    result.setMonth(result.getMonth() + n);
+    var maxDay = new Date(result.getFullYear(), result.getMonth() + 1, 0).getDate();
+    result.setDate(Math.min(day, maxDay));
+    return result;
+}
+
+function expandRRule(dtstart, rruleStr, now, cutoff) {
+    var rule     = parseRRule(rruleStr);
+    var freq     = rule.FREQ || "";
+    var interval = rule.INTERVAL ? parseInt(rule.INTERVAL, 10) : 1;
+    var count    = rule.COUNT    ? parseInt(rule.COUNT,    10) : -1;
+    var until    = rule.UNTIL    ? parseICSDate(rule.UNTIL) : null;
+    var occurrences = [];
+
+    // BYDAY: array of day-of-week numbers (0=Sun..6=Sat)
+    var byDay = [];
+    if (rule.BYDAY) {
+        var dayTokens = rule.BYDAY.split(",");
+        for (var d = 0; d < dayTokens.length; d++) {
+            // Strip optional ordinal prefix e.g. "+1MO" -> "MO"
+            var token = dayTokens[d].replace(/^[+-]?\d*/, "").toUpperCase();
+            if (BYDAY_MAP.hasOwnProperty(token)) byDay.push(BYDAY_MAP[token]);
+        }
+    }
+
+    // Hard cap: never iterate more than 500 steps to protect against
+    // runaway loops on very old recurring events with no UNTIL/COUNT.
+    var MAX_ITER = 500;
+    var iter     = 0;
+    var cursor   = new Date(dtstart.getTime());
+
+    while (iter++ < MAX_ITER) {
+        // Stop if we have gone past cutoff or hit UNTIL
+        if (cursor > cutoff) break;
+        if (until && cursor > until) break;
+        if (count === 0) break;
+
+        if (freq === "WEEKLY" && byDay.length > 0) {
+            // For weekly+BYDAY, check each day of the current week
+            // (week starting on the same weekday as dtstart to honour WKST=MO etc.)
+            // Simpler: just check all 7 days of the ISO week containing cursor.
+            var weekStart = new Date(cursor.getTime());
+            weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // back to Sunday
+            for (var wd = 0; wd < 7; wd++) {
+                var candidate = new Date(weekStart.getFullYear(),
+                                         weekStart.getMonth(),
+                                         weekStart.getDate() + wd,
+                                         dtstart.getHours(),
+                                         dtstart.getMinutes(),
+                                         dtstart.getSeconds());
+                if (candidate < dtstart) continue;       // before series start
+                if (until && candidate > until) continue;
+                if (candidate > cutoff) continue;
+                var inByDay = false;
+                for (var b = 0; b < byDay.length; b++) {
+                    if (candidate.getDay() === byDay[b]) { inByDay = true; break; }
+                }
+                if (!inByDay) continue;
+                if (candidate >= now) {
+                    occurrences.push(new Date(candidate.getTime()));
+                    if (count > 0 && --count === 0) break;
+                }
+            }
+            // Advance cursor by interval weeks
+            cursor.setDate(cursor.getDate() + 7 * interval);
+
+        } else {
+            // Simple case: one occurrence per step
+            if (cursor >= now) {
+                occurrences.push(new Date(cursor.getTime()));
+                if (count > 0 && --count === 0) break;
+            }
+            if (freq === "DAILY") {
+                cursor.setDate(cursor.getDate() + interval);
+            } else if (freq === "WEEKLY") {
+                cursor.setDate(cursor.getDate() + 7 * interval);
+            } else if (freq === "MONTHLY") {
+                cursor = addMonths(cursor, interval);
+            } else if (freq === "YEARLY") {
+                cursor = addMonths(cursor, 12 * interval);
+            } else {
+                break; // unknown freq
+            }
+        }
+    }
+
+    return occurrences;
+}
+
+// Convert a Date+duration into an arc event and push if it falls in window
+function pushArcEvent(events, calendarIndex, start, durationMs, now, cutoff) {
+    var end = new Date(start.getTime() + durationMs);
+    if (end <= now || start >= cutoff) return;
+    var startMins    = (start.getHours() * 60 + start.getMinutes()) % 720;
+    var endMins      = (end.getHours()   * 60 + end.getMinutes())   % 720;
+    var durationMins = endMins - startMins;
+    if (durationMins <= 0) durationMins += 720;
+    durationMins = Math.min(durationMins, 720);
+    if (durationMins > 0) {
+        events.push({ calIndex: calendarIndex, startMins: startMins, durationMins: durationMins });
+    }
+}
+
 function parseICS(raw, calendarIndex, now, cutoff) {
     var text  = unfoldICS(raw);
     var lines = text.split(/\r?\n/);
     var events = [];
     var inEvent = false, current = null;
 
+    // Collect EXDATE values at calendar level too (some feeds put them outside VEVENT)
+    var globalExdates = {};
+
     for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim();
         if (line === "BEGIN:VEVENT") {
             inEvent = true;
-            current = { dtstart: null, dtend: null, duration: null };
+            current = { dtstart: null, dtend: null, duration: null, rrule: null, exdates: {} };
             continue;
         }
         if (line === "END:VEVENT") {
             inEvent = false;
             if (current && current.dtstart) {
                 var start = current.dtstart;
-                var end   = current.dtend;
-                if (!end && current.duration) end = new Date(start.getTime() + current.duration);
-                if (!end) end = new Date(start.getTime() + 60 * 60 * 1000);
+                var durationMs;
+                if (current.dtend) {
+                    durationMs = current.dtend.getTime() - start.getTime();
+                } else if (current.duration) {
+                    durationMs = current.duration;
+                } else {
+                    durationMs = 60 * 60 * 1000; // default 1 hour
+                }
 
-                if (end > now && start < cutoff) {
-                    var startMins = (start.getHours() * 60 + start.getMinutes()) % 720;
-                    var endMins   = (end.getHours()   * 60 + end.getMinutes())   % 720;
-                    var durationMins = endMins - startMins;
-                    if (durationMins <= 0) durationMins += 720;
-                    durationMins = Math.min(durationMins, 720);
-
-                    if (durationMins > 0) {
-                        events.push({ calIndex: calendarIndex, startMins: startMins, durationMins: durationMins });
+                if (current.rrule) {
+                    // Recurring event: expand occurrences
+                    var occurrences = expandRRule(start, current.rrule, now, cutoff);
+                    for (var o = 0; o < occurrences.length; o++) {
+                        var occ = occurrences[o];
+                        // Check EXDATE: compare date-only strings to handle UTC vs local
+                        var occKey = dateOnly(occ).getTime();
+                        if (current.exdates[occKey]) continue;
+                        pushArcEvent(events, calendarIndex, occ, durationMs, now, cutoff);
                     }
+                } else {
+                    // Single event
+                    pushArcEvent(events, calendarIndex, start, durationMs, now, cutoff);
                 }
             }
             current = null;
@@ -113,11 +256,26 @@ function parseICS(raw, calendarIndex, now, cutoff) {
         if (!inEvent || !current) continue;
         var colonIdx = line.indexOf(":");
         if (colonIdx < 0) continue;
-        var key     = line.substring(0, colonIdx).toUpperCase().split(";")[0];
+        // Key may have parameters before colon e.g. "DTSTART;TZID=..."
+        var rawKey  = line.substring(0, colonIdx);
+        var key     = rawKey.toUpperCase().split(";")[0];
         var value   = line.substring(colonIdx + 1);
-        if (key === "DTSTART")       current.dtstart  = parseICSDate(value);
-        else if (key === "DTEND")    current.dtend    = parseICSDate(value);
-        else if (key === "DURATION") current.duration = parseDuration(value);
+        if (key === "DTSTART") {
+            current.dtstart = parseICSDate(value);
+        } else if (key === "DTEND") {
+            current.dtend = parseICSDate(value);
+        } else if (key === "DURATION") {
+            current.duration = parseDuration(value);
+        } else if (key === "RRULE") {
+            current.rrule = value;
+        } else if (key === "EXDATE") {
+            // EXDATE may list multiple dates comma-separated
+            var exParts = value.split(",");
+            for (var ex = 0; ex < exParts.length; ex++) {
+                var exDate = parseICSDate(exParts[ex].trim());
+                if (exDate) current.exdates[dateOnly(exDate).getTime()] = true;
+            }
+        }
     }
     return events;
 }
