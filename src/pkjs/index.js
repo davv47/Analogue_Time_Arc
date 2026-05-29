@@ -193,7 +193,7 @@ function expandRRule(dtstart, rruleStr, now, cutoff) {
 }
 
 // Convert a Date+duration into an arc event and push if it falls in window
-function pushArcEvent(events, calendarIndex, start, durationMs, now, cutoff) {
+function pushArcEvent(events, calendarIndex, start, durationMs, now, cutoff, title) {
     var end = new Date(start.getTime() + durationMs);
     if (end <= now || start >= cutoff) return;
     var startMins    = (start.getHours() * 60 + start.getMinutes()) % 720;
@@ -202,81 +202,130 @@ function pushArcEvent(events, calendarIndex, start, durationMs, now, cutoff) {
     if (durationMins <= 0) durationMins += 720;
     durationMins = Math.min(durationMins, 720);
     if (durationMins > 0) {
-        events.push({ calIndex: calendarIndex, startMins: startMins, durationMins: durationMins });
+        events.push({ calIndex: calendarIndex, startMins: startMins, durationMins: durationMins, title: title || "" });
     }
 }
 
 function parseICS(raw, calendarIndex, now, cutoff) {
-    var text  = unfoldICS(raw);
+    var text = unfoldICS(raw);
     var lines = text.split(/\r?\n/);
-    var events = [];
-    var inEvent = false, current = null;
 
-    // Collect EXDATE values at calendar level too (some feeds put them outside VEVENT)
-    var globalExdates = {};
+    var events = [];
+
+    var inEvent = false;
+    var current = null;
 
     for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim();
+        if (!line) continue;
+
+        // ─── State transitions ─────────────────────────────
         if (line === "BEGIN:VEVENT") {
             inEvent = true;
-            current = { dtstart: null, dtend: null, duration: null, rrule: null, exdates: {} };
+            current = {
+                dtstart: null,
+                dtend: null,
+                duration: null,
+                rrule: null,
+                exdates: {},
+                summary: ""
+            };
             continue;
         }
+
         if (line === "END:VEVENT") {
-            inEvent = false;
             if (current && current.dtstart) {
                 var start = current.dtstart;
                 var durationMs;
+
                 if (current.dtend) {
                     durationMs = current.dtend.getTime() - start.getTime();
                 } else if (current.duration) {
                     durationMs = current.duration;
                 } else {
-                    durationMs = 60 * 60 * 1000; // default 1 hour
+                    durationMs = 60 * 60 * 1000;
                 }
 
                 if (current.rrule) {
-                    // Recurring event: expand occurrences
                     var occurrences = expandRRule(start, current.rrule, now, cutoff);
+
                     for (var o = 0; o < occurrences.length; o++) {
                         var occ = occurrences[o];
-                        // Check EXDATE: compare date-only strings to handle UTC vs local
-                        var occKey = dateOnly(occ).getTime();
-                        if (current.exdates[occKey]) continue;
-                        pushArcEvent(events, calendarIndex, occ, durationMs, now, cutoff);
+
+                        var key = dateOnly(occ).getTime();
+                        if (current.exdates[key]) continue;
+
+                        pushArcEvent(
+                            events,
+                            calendarIndex,
+                            occ,
+                            durationMs,
+                            now,
+                            cutoff,
+                            current.summary
+                        );
                     }
                 } else {
-                    // Single event
-                    pushArcEvent(events, calendarIndex, start, durationMs, now, cutoff);
+                    pushArcEvent(
+                        events,
+                        calendarIndex,
+                        start,
+                        durationMs,
+                        now,
+                        cutoff,
+                        current.summary
+                    );
                 }
             }
+
+            inEvent = false;
             current = null;
             continue;
         }
+
+        // ─── Ignore everything outside VEVENT ───────────────
         if (!inEvent || !current) continue;
+
+        // ─── Key/Value parsing ──────────────────────────────
         var colonIdx = line.indexOf(":");
         if (colonIdx < 0) continue;
-        // Key may have parameters before colon e.g. "DTSTART;TZID=..."
-        var rawKey  = line.substring(0, colonIdx);
-        var key     = rawKey.toUpperCase().split(";")[0];
-        var value   = line.substring(colonIdx + 1);
+
+        var rawKey = line.substring(0, colonIdx);
+        var key = rawKey.toUpperCase().split(";")[0];
+        var value = line.substring(colonIdx + 1);
+
+        // ─── Property handling ──────────────────────────────
         if (key === "DTSTART") {
             current.dtstart = parseICSDate(value);
-        } else if (key === "DTEND") {
+        }
+
+        else if (key === "DTEND") {
             current.dtend = parseICSDate(value);
-        } else if (key === "DURATION") {
+        }
+
+        else if (key === "DURATION") {
             current.duration = parseDuration(value);
-        } else if (key === "RRULE") {
+        }
+
+        else if (key === "RRULE") {
             current.rrule = value;
-        } else if (key === "EXDATE") {
-            // EXDATE may list multiple dates comma-separated
+        }
+
+        else if (key === "SUMMARY") {
+            current.summary = value;
+        }
+
+        else if (key === "EXDATE") {
             var exParts = value.split(",");
             for (var ex = 0; ex < exParts.length; ex++) {
                 var exDate = parseICSDate(exParts[ex].trim());
-                if (exDate) current.exdates[dateOnly(exDate).getTime()] = true;
+                if (exDate) {
+                    current.exdates[dateOnly(exDate).getTime()] = true;
+                }
             }
         }
     }
+
     return events;
 }
 
@@ -299,6 +348,10 @@ function sendDisplaySettings() {
         8:  (config.showTicks !== false) ? 1 : 0,
         12: typeof config.hourColor === "number" ? config.hourColor : 11,
         13: packedColors,
+        14: typeof config.minuteColor === "number" ? config.minuteColor : 11,
+        21: (config.showSeconds !== false) ? 1 : 0,
+        22: (config.batteryWarningOnly !== false) ? 1 : 0,
+        23: config.overlayAboveHands ? 1 : 0,
     };
     Pebble.sendAppMessage(msg, function() {
         console.log("Display settings sent: " + JSON.stringify(msg));
@@ -310,17 +363,57 @@ function sendDisplaySettings() {
 // ─── Send events ─────────────────────────────────────────────────────────────
 
 function sendEventsToWatch(events) {
-    events.sort(function(a, b) { return a.startMins - b.startMins; });
+
+    var now = new Date();
+
+    var nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+    events.sort(function(a, b) {
+
+        function activeScore(e) {
+            var end = e.startMins + e.durationMins;
+            return (nowMinutes >= e.startMins && nowMinutes < end) ? 0 : 1;
+        }
+
+        var sa = activeScore(a);
+        var sb = activeScore(b);
+
+        if (sa !== sb) return sa - sb;
+
+        return a.startMins - b.startMins;
+    });
+
     events = events.slice(0, 10);
+
     var packed = events.map(function(e) {
         return e.startMins + "," + e.durationMins + "," + e.calIndex;
     }).join("|");
+
+    var next = events.slice(0, 3);
+
+    var msg = {
+
+        5: packed,
+
+        15: next[0] && next[0].title ? next[0].title.substring(0, 28) : "",
+        16: next[1] && next[1].title ? next[1].title.substring(0, 28) : "",
+        17: next[2] && next[2].title ? next[2].title.substring(0, 28) : "",
+
+        18: next[0] ? next[0].calIndex : 0,
+        19: next[1] ? next[1].calIndex : 0,
+        20: next[2] ? next[2].calIndex : 0
+    };
+
     console.log("Sending " + events.length + " events: " + packed);
-    Pebble.sendAppMessage({ 5: packed }, function() {
-        console.log("Events sent");
-    }, function(e) {
-        console.log("Send failed: " + JSON.stringify(e));
-    });
+
+    Pebble.sendAppMessage(msg,
+        function() {
+            console.log("Events sent");
+        },
+        function(e) {
+            console.log("Send failed: " + JSON.stringify(e));
+        }
+    );
 }
 
 // ─── Fetch calendars ──────────────────────────────────────────────────────────
@@ -430,8 +523,10 @@ Pebble.addEventListener("ready", function() {
 
 Pebble.addEventListener("showConfiguration", function() {
     var config = localStorage.getItem("calendarConfig") || "{}";
-    Pebble.openURL("https://davv47.github.io/pebble-analogue-config/index.html?config="
+    Pebble.openURL("https://protarios.github.io/pebble-analogue-config/index.html?config="
                    + encodeURIComponent(config));
+    //Pebble.openURL("https://your-config-page/index.html?config="char
+    //                + encodeURIComponent(config));
 });
 
 Pebble.addEventListener("webviewclosed", function(e) {
